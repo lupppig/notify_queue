@@ -1,16 +1,10 @@
 const POLL_MS = 2000;
 const STATUSES = ["pending", "queued", "claimed", "sent", "failed", "dead_lettered"];
 
-const PAYLOAD_FIELDS = {
-  email: [
-    { key: "subject", kind: "input", placeholder: "Welcome aboard" },
-    { key: "body", kind: "textarea", placeholder: "Hi there, ..." },
-  ],
-  sms: [{ key: "message", kind: "textarea", placeholder: "Your code is 123456" }],
-  push: [
-    { key: "title", kind: "input", placeholder: "Order shipped" },
-    { key: "body", kind: "textarea", placeholder: "Your package is on its way" },
-  ],
+const PAYLOAD_EXAMPLES = {
+  email: { subject: "Welcome aboard", body: "Hi there, thanks for signing up." },
+  sms: { message: "Your verification code is 123456" },
+  push: { title: "Order shipped", body: "Your package is on its way" },
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -150,16 +144,25 @@ function segmented(el, onChange) {
   });
 }
 
-function renderPayloadFields() {
-  $("#payload-fields").innerHTML = PAYLOAD_FIELDS[state.channel]
-    .map(({ key, kind, placeholder }) => {
-      const control =
-        kind === "textarea"
-          ? `<textarea id="payload-${key}" placeholder="${placeholder}"></textarea>`
-          : `<input id="payload-${key}" placeholder="${placeholder}" autocomplete="off">`;
-      return `<div class="field"><label for="payload-${key}">${key}</label>${control}</div>`;
-    })
-    .join("");
+function setPayloadExample() {
+  const editor = $("#payload");
+  if (editor.dataset.touched !== "1" || !editor.value.trim()) {
+    editor.value = JSON.stringify(PAYLOAD_EXAMPLES[state.channel], null, 2);
+  }
+}
+
+function parsePayload() {
+  const editor = $("#payload");
+  let payload;
+  try {
+    payload = JSON.parse(editor.value);
+  } catch (err) {
+    return invalid(editor, `payload: ${err.message}`);
+  }
+  if (payload === null || Array.isArray(payload) || typeof payload !== "object") {
+    return invalid(editor, "payload must be a json object");
+  }
+  return payload;
 }
 
 function scheduleFields() {
@@ -192,13 +195,8 @@ function buildRequest() {
   if (state.channel === "email" && !recipient.includes("@"))
     return invalid($("#recipient"), "email channel needs an email address");
 
-  const payload = {};
-  for (const { key } of PAYLOAD_FIELDS[state.channel]) {
-    const el = $(`#payload-${key}`);
-    const value = el.value.trim();
-    if (!value) return invalid(el, `${key} is required`);
-    payload[key] = value;
-  }
+  const payload = parsePayload();
+  if (payload === null) return null;
 
   const body = { recipient, channel: state.channel, priority: state.priority, payload };
 
@@ -239,7 +237,6 @@ async function submitJob(event) {
     const data = await res.json();
     if (res.status === 201) {
       toast(`scheduled ${shortId(data.job_id)} · ${body.priority} ${body.channel}`, "ok");
-      for (const { key } of PAYLOAD_FIELDS[state.channel]) $(`#payload-${key}`).value = "";
       $("#idempotency-key").value = "";
     } else if (res.status === 409) {
       toast(`duplicate idempotency key — existing job ${shortId(data.existing_job_id)}`, "warn");
@@ -294,7 +291,7 @@ async function retryAll() {
 
 segmented($("#channel"), (value) => {
   state.channel = value;
-  renderPayloadFields();
+  setPayloadExample();
 });
 segmented($("#priority"), (value) => (state.priority = value));
 segmented($("#schedule-mode"), (value) => {
@@ -303,6 +300,11 @@ segmented($("#schedule-mode"), (value) => {
 });
 
 $("#job-form").addEventListener("submit", submitJob);
+$("#payload").addEventListener("input", (e) => (e.target.dataset.touched = "1"));
+$("#format-json").addEventListener("click", () => {
+  const payload = parsePayload();
+  if (payload !== null) $("#payload").value = JSON.stringify(payload, null, 2);
+});
 $("#use-mock").addEventListener("click", () => {
   $("#callback-url").value = `${location.origin}/webhook-mock`;
 });
@@ -319,7 +321,7 @@ $("#clear-filter").addEventListener("click", () => {
   refresh();
 });
 
-renderPayloadFields();
+setPayloadExample();
 scheduleFields();
 refresh();
 setInterval(refresh, POLL_MS);

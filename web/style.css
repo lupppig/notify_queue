@@ -131,6 +131,11 @@ textarea { resize: vertical; min-height: 56px; }
 input:focus, select:focus, textarea:focus { outline: 1px solid var(--blue); }
 input.invalid, textarea.invalid { border-color: var(--red); }
 
+.field-head { display: flex; justify-content: space-between; align-items: baseline; }
+.field-head button { font-size: 11px; padding: 2px 8px; }
+
+textarea.json { min-height: 120px; white-space: pre; }
+
 .inline { display: flex; gap: 6px; }
 .inline input { flex: 1; }
 .inline button { width: auto; white-space: nowrap; }
