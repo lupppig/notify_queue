@@ -315,7 +315,7 @@ async def promote_due_jobs():
             SELECT id FROM jobs
             WHERE status = 'pending'
               AND send_at <= NOW() + INTERVAL '5 seconds'
-            ORDER BY priority DESC, send_at ASC
+            ORDER BY priority ASC, send_at ASC
             LIMIT 500
             FOR UPDATE SKIP LOCKED
         )
@@ -336,13 +336,15 @@ async def promote_due_jobs():
 
 ```python
 def priority_score(priority: str, send_at: datetime) -> float:
-    weights = {"high": 0, "medium": 1_000_000, "low": 2_000_000}
+    weights = {"high": 0, "medium": 10_000_000_000, "low": 20_000_000_000}
     return weights[priority] + send_at.timestamp()
 ```
 
 The score is a composite: priority weight (an offset) plus the Unix timestamp. A high-priority job always has a lower score than a medium-priority job regardless of their `send_at` times. Within the same priority level, earlier `send_at` has a lower score and is processed first. Workers use `ZPOPMIN` which returns the lowest score first.
 
-**Example:** A high-priority job due at T=100 has score 100. A medium-priority job due at T=50 has score 1,000,050. The high-priority job is always processed first even though it is due later.
+**Why 10 billion?** The weight must dominate the timestamp. Unix timestamps are currently ~1.7 billion; a weight of 1 million would let a high-priority job due far in the future score above a medium-priority job due in the past. 10 billion exceeds any representable delivery time, so priority always wins, and float64 still resolves the score to well under a millisecond.
+
+**Example:** A high-priority job due at T=1,700,000,100 has score 1,700,000,100. A medium-priority job due at T=1,700,000,050 has score 11,700,000,050. The high-priority job is always processed first even though it is due later.
 
 ### 6.3 Stale Job Recovery (Heartbeat Check)
 
