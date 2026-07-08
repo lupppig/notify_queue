@@ -42,56 +42,25 @@ The scheduler is the clock. The workers are the hands.
 
 ## 3. High-Level Architecture
 
+```mermaid
+flowchart TD
+    client([Client]) -->|HTTP| api["FastAPI<br/>POST /jobs · status · metrics · dashboard"]
+    api -->|"idempotency check + job insert, one txn"| pg[("PostgreSQL · source of truth<br/>jobs · job_idempotency · dead_letter_queue · webhook_log")]
+    pg -->|"poll send_at ≤ NOW() every 500ms"| sched["Task Scheduler<br/>promote due · recover stale claims · requeue lost"]
+    sched -->|"ZADD, score = priority weight + send_at"| redis[("Redis priority queues<br/>queue:high · queue:medium · queue:low")]
+    redis -->|"ZPOPMIN + SET NX lock"| workers["Worker Pool × N<br/>claim · heartbeat · rate limit · deliver (stub)"]
+    workers -->|"fenced updates: sent / retry / defer / dead-letter"| pg
+    workers -->|"POST on every status change"| hooks([Webhook receiver])
+
+    classDef store fill:#161b22,stroke:#bc8cff,color:#c9d1d9
+    classDef proc fill:#161b22,stroke:#3fb950,color:#c9d1d9
+    classDef ext fill:#161b22,stroke:#8b949e,color:#c9d1d9
+    class pg,redis store
+    class api,sched,workers proc
+    class client,hooks ext
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Client                               │
-└─────────────────────────┬───────────────────────────────────┘
-                          │ HTTP
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     FastAPI Layer                           │
-│  POST /jobs            GET /jobs/{id}/status               │
-│  GET /metrics          POST /webhook-mock (stub receiver)  │
-└───────────┬─────────────────────────────────────────────────┘
-            │
-     ┌──────▼──────┐
-     │  Idempotency │
-     │  Check (PG)  │
-     └──────┬──────┘
-            │ write job → PostgreSQL
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    PostgreSQL (job store)                   │
-│  jobs · job_idempotency · dead_letter_queue · webhook_log  │
-└───────────────────────┬─────────────────────────────────────┘
-                        │ poll send_at <= NOW()
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Task Scheduler                            │
-│  Runs every 500ms · promotes due jobs to Redis queues      │
-│  Updates job status: pending → queued                      │
-└───────────────────────┬─────────────────────────────────────┘
-                        │ ZADD with score = priority_ts
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Redis Priority Queues                          │
-│  queue:high    queue:medium    queue:low                   │
-│  Score = composite: priority_weight + send_at timestamp    │
-└───────────────────────┬─────────────────────────────────────┘
-                        │ ZPOPMIN (atomic claim)
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Worker Pool (N instances)                      │
-│  Heartbeat · Distributed lock · Rate limiter (Redis INCR)  │
-│  Delivery stub · Retry · DLQ · Defer when rate-limited     │
-└───────────┬─────────────────────────────────────────────────┘
-            │ status change
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Webhook Dispatcher                             │
-│  POST to callback_url · log to webhook_log · retry on 5xx  │
-└─────────────────────────────────────────────────────────────┘
-```
+
+Retries and rate-limit deferrals loop back through PostgreSQL (a `send_at` reset) — the scheduler is the only component that ever enqueues to Redis.
 
 ---
 
@@ -140,6 +109,9 @@ CREATE INDEX idx_jobs_scheduler ON jobs (send_at, status)
 
 CREATE INDEX idx_jobs_heartbeat ON jobs (heartbeat_at, status)
     WHERE status = 'claimed';
+
+CREATE INDEX idx_jobs_queued ON jobs (updated_at)
+    WHERE status = 'queued';
 
 CREATE INDEX idx_jobs_recipient ON jobs (recipient, status);
 ```
@@ -275,9 +247,19 @@ Schedule a notification job.
 
 **Implementation note:** This is a `SELECT status, COUNT(*) FROM jobs GROUP BY status` query. At scale, this query can be expensive on a large jobs table. The right solution is to maintain a Redis counter per status and increment/decrement atomically on every status transition. The database query becomes a fallback for reconciliation. For the initial implementation, the database query is fine.
 
+### GET /jobs?status=&limit=
+
+Recent jobs, newest first, optionally filtered by status. Powers the dashboard's job table.
+
+### POST /jobs/{job_id}/retry
+
+Replays a dead-lettered job: resets `attempt_count` to 0, `status` to `pending` and `send_at` to now, so it flows through the normal promotion path. Only valid from `dead_lettered` (409 otherwise). This is the manual-replay story for the DLQ (Section 4.3).
+
 ### POST /webhook-mock
 
 A stub receiver that logs incoming webhook payloads and returns 200. Used for local testing.
+
+Interactive OpenAPI docs for all endpoints are served at `/docs`; a live dashboard (metrics, job table, submission form, DLQ replay) is served at `/`.
 
 ```json
 {
@@ -298,8 +280,11 @@ async def scheduler_loop():
     while True:
         await promote_due_jobs()
         await recover_stale_claimed_jobs()
+        await requeue_stale_queued_jobs()
         await asyncio.sleep(0.5)
 ```
+
+A failed tick is logged and retried on the next poll interval — a transient database or Redis error must never kill the scheduler, because it is the one process the system cannot lose. The workers apply the same rule to their loop.
 
 ### 6.1 Promote Due Jobs
 
@@ -377,6 +362,29 @@ async def recover_stale_claimed_jobs():
 **Why reset to `pending` instead of `queued`?** Resetting to `pending` lets the scheduler re-evaluate whether the job is still due and re-enqueue it cleanly. Jumping directly to `queued` and re-adding to Redis risks double-enqueue if the job is somehow still in the Redis queue from the dead worker's earlier claim.
 
 **Why increment `attempt_count` on reclaim?** The worker-side failure handler (`handle_failure`, Section 7.6) never runs if the worker process crashes outright. If the reclaim did not count as an attempt, a poison message that crashes every worker that touches it would be reclaimed and retried forever. Counting the reclaim as an attempt makes the `max_attempts` cap the circuit breaker even for hard crashes — after enough reclaims, the scheduler dead-letters the job directly.
+
+The recovery path also deletes the dead worker's Redis lock so the reclaimed job can be re-claimed immediately instead of waiting out the lock TTL.
+
+### 6.4 Requeue Rescue (Queued but Not in Redis)
+
+```python
+async def requeue_stale_queued_jobs():
+    # A job stuck in 'queued' for longer than the threshold never reached
+    # Redis: the scheduler crashed between the status update and ZADD, or
+    # Redis lost the queue entry. Re-adding is safe because ZADD is
+    # idempotent per member.
+    jobs = await db.fetch("""
+        SELECT id, priority, send_at FROM jobs
+        WHERE status = 'queued'
+          AND updated_at < NOW() - INTERVAL '30 seconds'
+        LIMIT 500
+    """)
+    for job in jobs:
+        await redis.zadd(f"queue:{job.priority}",
+                         {str(job.id): priority_score(job.priority, job.send_at)})
+```
+
+**Why is this needed?** The promotion path updates the row to `queued` first and writes to Redis second. A crash between the two strands the job: it is no longer `pending` (so promotion ignores it) and not in Redis (so no worker will ever see it). This sweep closes that gap, and also covers Redis losing data despite AOF persistence (Section 10.4). The partial index `idx_jobs_queued` keeps the scan cheap.
 
 ---
 
@@ -506,11 +514,15 @@ async def execute_delivery(job_id: str, worker_id: str):
 
 ```python
 async def handle_success(job: dict, worker_id: str):
-    await db.execute("""
+    updated = await db.fetchrow("""
         UPDATE jobs
         SET status = 'sent', sent_at = NOW(), updated_at = NOW()
-        WHERE id = $1
-    """, job['id'])
+        WHERE id = $1 AND worker_id = $2 AND status = 'claimed'
+        RETURNING id
+    """, job['id'], worker_id)
+    
+    if updated is None:
+        return  # no longer ours — see 7.8
     
     await redis.delete(f"job:lock:{job['id']}")
     await fire_webhook(job['id'], job['callback_url'], 'sent')
@@ -534,7 +546,7 @@ async def handle_failure(job: dict, error: str, worker_id: str):
     delay = BASE_DELAY_SECONDS * (2 ** (attempt - 1))
     next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
     
-    await db.execute("""
+    updated = await db.fetchrow("""
         UPDATE jobs
         SET status = 'pending',
             attempt_count = $1,
@@ -543,8 +555,12 @@ async def handle_failure(job: dict, error: str, worker_id: str):
             error_message = $3,
             worker_id = NULL,
             updated_at = NOW()
-        WHERE id = $4
-    """, attempt, next_retry_at, error, job['id'])
+        WHERE id = $4 AND worker_id = $5 AND status = 'claimed'
+        RETURNING id
+    """, attempt, next_retry_at, error, job['id'], worker_id)
+    
+    if updated is None:
+        return  # no longer ours — see 7.8
     
     await redis.delete(f"job:lock:{job['id']}")
     await fire_webhook(job['id'], job['callback_url'], 'failed')
@@ -555,30 +571,44 @@ async def handle_failure(job: dict, error: str, worker_id: str):
 ### 7.7 Dead-Letter
 
 ```python
-async def dead_letter(job: dict, error: str):
+async def dead_letter(job: dict, error: str, attempt_count: int,
+                      expected_worker_id: str | None):
     async with db.transaction():
-        await db.execute("""
+        marked = await db.fetchrow("""
             UPDATE jobs
             SET status = 'dead_lettered',
                 error_message = $1,
+                attempt_count = $3,
                 failed_at = NOW(),
                 worker_id = NULL,
                 updated_at = NOW()
-            WHERE id = $2
-        """, error, job['id'])
+            WHERE id = $2 AND worker_id IS NOT DISTINCT FROM $4
+            RETURNING id
+        """, error, job['id'], attempt_count, expected_worker_id)
+        
+        if marked is None:
+            return  # no longer owned by the caller — see 7.8
         
         await db.execute("""
             INSERT INTO dead_letter_queue
                 (job_id, recipient, channel, payload, attempt_count, last_error)
             VALUES ($1, $2, $3, $4, $5, $6)
         """, job['id'], job['recipient'], job['channel'],
-             job['payload'], job['attempt_count'], error)
+             job['payload'], attempt_count, error)
     
     await redis.delete(f"job:lock:{job['id']}")
     await fire_webhook(job['id'], job['callback_url'], 'dead_lettered')
 ```
 
-The status update and DLQ insert are in a single transaction. If the DLQ insert fails, the job stays in its previous state and will be retried. This prevents a job from being marked `dead_lettered` in the jobs table but missing from the DLQ.
+The status update and DLQ insert are in a single transaction. If the DLQ insert fails, the job stays in its previous state and will be retried. This prevents a job from being marked `dead_lettered` in the jobs table but missing from the DLQ. A worker passes its own `expected_worker_id`; the scheduler's recovery path passes `None` for the job it has just reset.
+
+### 7.8 Ownership Fencing (Zombie Workers)
+
+Every terminal transition above is conditional on the caller still owning the job (`worker_id = <mine> AND status = 'claimed'`), and the rate-limit deferral (Section 9.1) carries the same fence.
+
+**Why?** The heartbeat timeout declares a worker dead after 30 silent seconds — but a worker can be silent without being dead: a long GC pause, a network partition, a suspended VM. The scheduler reclaims its job, another worker picks it up, and then the original worker *wakes up* and finishes its stale work. Without the fence, that zombie's unconditional `UPDATE` would overwrite state now owned by someone else: marking `sent` a job mid-retry elsewhere, or resetting to `pending` a job that was already delivered — turning one duplicate delivery into arbitrarily many.
+
+With the fence, the zombie's update matches zero rows, it skips its webhook and lock cleanup, and reality is whatever the current owner says it is. This is the fencing-token pattern from distributed locking, implemented with the columns already on the row. The one thing the fence cannot undo is the zombie's *delivery itself* (Section 10.3) — that remains the documented at-least-once edge case; the fence stops it from corrupting state on top of it.
 
 ---
 
@@ -699,10 +729,10 @@ The `FOR UPDATE SKIP LOCKED` pattern means a job is only promoted once. If the s
 The heartbeat stops. The scheduler detects `heartbeat_at < NOW() - 30s` and resets the job to `pending`. The scheduler re-promotes it on the next cycle. The Redis lock expires (60s TTL) before or around the same time. Clean recovery with at most 30-60s delay.
 
 ### 10.3 Worker crashes after delivering but before updating status
-The job was delivered but still shows `claimed` in the database. The scheduler will reclaim it and a worker will attempt re-delivery. The delivery stub will fire again. This is the only scenario where at-least-once delivery is possible rather than exactly-once. To make this truly exactly-once, the delivery and status update must be in the same atomic operation, which is not possible with an external HTTP call. The mitigation is to make the delivery idempotent at the receiver (not in scope for this system).
+The job was delivered but still shows `claimed` in the database. The scheduler will reclaim it and a worker will attempt re-delivery. The delivery stub will fire again. This is the only scenario where at-least-once delivery is possible rather than exactly-once. To make this truly exactly-once, the delivery and status update must be in the same atomic operation, which is not possible with an external HTTP call. The mitigation is to make the delivery idempotent at the receiver (not in scope for this system). If the worker was stalled rather than dead and wakes up later, the ownership fence (Section 7.8) blocks its stale update, so the duplicate cannot cascade into further state corruption.
 
 ### 10.4 Redis queue loss on restart
-Redis is configured with AOF persistence. On restart, the queues are rebuilt from the AOF log. If Redis loses data despite persistence, the scheduler re-promotes all `queued` status jobs on its next run because their status never advanced to `claimed`. No jobs are permanently lost.
+Redis is configured with AOF persistence. On restart, the queues are rebuilt from the AOF log. If Redis loses data despite persistence, the requeue sweep (Section 6.4) re-adds every job stuck in `queued` back to its priority queue. No jobs are permanently lost.
 
 ### 10.5 Clock skew between services
 The scheduler uses a 5-second lookahead. Jobs scheduled for exactly `NOW()` are still promoted even with 1-2 second clock drift between the scheduler host and the database host.
@@ -748,35 +778,43 @@ Twenty jobs for the same recipient all come due at 10:00 with a limit of 10/hour
 ## 12. Environment Variables
 
 ```env
-DATABASE_URL=postgresql://user:pass@localhost:5432/notifications
-REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgresql://notify:notify@localhost:5433/notifications
+REDIS_URL=redis://localhost:6380/0
 RATE_LIMIT_PER_HOUR=10
 DELIVERY_FAILURE_RATE=0.1
 MAX_ATTEMPTS=5
 BASE_RETRY_DELAY_SECONDS=30
 SCHEDULER_POLL_INTERVAL_MS=500
+SCHEDULER_LOOKAHEAD_SECONDS=5
+SCHEDULER_BATCH_SIZE=500
+QUEUED_REQUEUE_SECONDS=30
 HEARTBEAT_INTERVAL_SECONDS=10
 HEARTBEAT_TIMEOUT_SECONDS=30
 WORKER_COUNT=4
+WORKER_IDLE_SLEEP_SECONDS=0.1
+ERROR_BACKOFF_SECONDS=1.0
+JOB_LOCK_TTL_SECONDS=60
+WEBHOOK_TIMEOUT_SECONDS=5.0
+WEBHOOK_MAX_ATTEMPTS=3
 ```
+
+Postgres and Redis map to host ports 5433 and 6380 to avoid clashing with commonly running local instances.
 
 ---
 
 ## 13. Running the System
 
 ```bash
-# Start infrastructure
-docker-compose up -d postgres redis
-
-# Run migrations
-psql $DATABASE_URL -f migrations/001_initial.sql
-
-# Start API
-uvicorn main:app --host 0.0.0.0 --port 8000
-
-# Start scheduler (separate process)
-python -m scheduler.scheduler
-
-# Start workers (separate process, N instances)
-python -m worker.worker --worker-count 4
+make setup      # start postgres + redis, install deps, apply schema
+make dev        # run api, scheduler and workers together (ctrl-c stops all)
 ```
+
+Or each process separately:
+
+```bash
+uv run uvicorn notify_queue.api.app:app --host 127.0.0.1 --port 8080
+uv run python -m notify_queue.scheduler
+uv run python -m notify_queue.worker
+```
+
+Dashboard at http://127.0.0.1:8080, OpenAPI docs at /docs. `make seed` fills the database with realistic data; `make simulate` drives the running system end to end; `make test` runs the suite.
