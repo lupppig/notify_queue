@@ -38,23 +38,7 @@ You can run one scheduler and fifty workers. If workers back up, the scheduler i
 
 ## 3. High-Level Architecture
 
-```mermaid
-flowchart TD
-    client([Client]) -->|HTTP| api["FastAPI<br/>POST /jobs · status · metrics · dashboard"]
-    api -->|"idempotency check + job insert, one txn"| pg[("PostgreSQL · source of truth<br/>jobs · job_idempotency · dead_letter_queue · webhook_log")]
-    pg -->|"poll send_at ≤ NOW() every 500ms"| sched["Task Scheduler<br/>promote due · recover stale claims · requeue lost"]
-    sched -->|"ZADD, score = priority weight + send_at"| redis[("Redis priority queues<br/>queue:high · queue:medium · queue:low")]
-    redis -->|"ZPOPMIN + SET NX lock"| workers["Worker Pool × N<br/>claim · heartbeat · rate limit · deliver (stub)"]
-    workers -->|"fenced updates: sent / retry / defer / dead-letter"| pg
-    workers -->|"POST on every status change"| hooks([Webhook receiver])
-
-    classDef store fill:#161b22,stroke:#bc8cff,color:#c9d1d9
-    classDef proc fill:#161b22,stroke:#3fb950,color:#c9d1d9
-    classDef ext fill:#161b22,stroke:#8b949e,color:#c9d1d9
-    class pg,redis store
-    class api,sched,workers proc
-    class client,hooks ext
-```
+![High-Level Architecture](diagram.png)
 
 Retries and rate-limit deferrals loop back through PostgreSQL (a `send_at` reset) — the scheduler is the only component that ever enqueues to Redis.
 

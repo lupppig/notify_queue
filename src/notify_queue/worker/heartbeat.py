@@ -1,3 +1,5 @@
+"""Periodic heartbeat updates to signal worker liveness."""
+
 import asyncio
 import contextlib
 import uuid
@@ -17,6 +19,11 @@ async def heartbeat_loop(
     stop: asyncio.Event,
     interval_seconds: float,
 ) -> None:
+    """Update ``heartbeat_at`` every *interval_seconds* until *stop* is set.
+
+    The scheduler reclaims jobs whose heartbeat falls behind the timeout,
+    so this loop must keep running for the duration of job processing.
+    """
     while not stop.is_set():
         await pool.execute(UPDATE_HEARTBEAT, job_id, worker_id)
         with contextlib.suppress(TimeoutError):

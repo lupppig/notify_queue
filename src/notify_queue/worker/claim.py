@@ -1,3 +1,5 @@
+"""Job claiming with three-gate exactly-once semantics."""
+
 import uuid
 
 import asyncpg
@@ -19,8 +21,12 @@ RETURNING id
 async def claim_next_job(
     pool: asyncpg.Pool, redis_client: redis.Redis, worker_id: str, settings: Settings
 ) -> uuid.UUID | None:
-    # Three independent exactly-once gates (DESIGN.md §7.2): atomic ZPOPMIN,
-    # a SET NX lock, and the conditional status transition in PostgreSQL.
+    """Attempt to claim the highest-priority job from Redis.
+
+    Three independent exactly-once gates prevent duplicate claims
+    (DESIGN.md §7.2): atomic ``ZPOPMIN``, a ``SET NX`` Redis lock, and the
+    conditional ``status = 'queued'`` transition in PostgreSQL.
+    """
     for priority in PRIORITY_ORDER:
         popped = await redis_client.zpopmin(f"queue:{priority}", count=1)
         if not popped:

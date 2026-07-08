@@ -1,7 +1,15 @@
+"""Application settings loaded from environment variables and ``.env``."""
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Central configuration for the notification queue system.
+
+    Every timing constant and limit is an environment variable so the system
+    can be tuned without code changes.  See ``.env.example`` for reference.
+    """
+
     model_config = SettingsConfigDict(env_file=".env")
 
     database_url: str = "postgresql://notify:notify@localhost:5433/notifications"

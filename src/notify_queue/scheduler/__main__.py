@@ -1,3 +1,5 @@
+"""Scheduler entry point: single-loop process that promotes, recovers, and requeues."""
+
 import asyncio
 import contextlib
 import logging
@@ -5,6 +7,7 @@ import signal
 
 from notify_queue.config import Settings
 from notify_queue.db import create_pool
+from notify_queue.log import setup_logging
 from notify_queue.redis_client import create_redis
 from notify_queue.scheduler.scheduler import (
     promote_due_jobs,
@@ -16,7 +19,12 @@ logger = logging.getLogger("notify_queue.scheduler")
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    """Run the scheduler loop: promote → recover → requeue → sleep, repeating until signalled.
+
+    The scheduler is the one process the system cannot lose; a failed tick
+    is logged and retried on the next poll interval.
+    """
+    setup_logging("scheduler")
     settings = Settings()
     pool = await create_pool(settings.database_url)
     redis_client = create_redis(settings.redis_url)
@@ -41,8 +49,6 @@ async def main() -> None:
                         len(requeued),
                     )
             except Exception:
-                # The scheduler is the one process the system cannot lose;
-                # a failed tick is retried on the next poll interval.
                 logger.exception("scheduler tick failed")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(

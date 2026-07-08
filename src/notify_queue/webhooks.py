@@ -1,3 +1,5 @@
+"""Best-effort webhook dispatcher with retry and audit logging."""
+
 import asyncio
 import logging
 import uuid
@@ -23,7 +25,12 @@ async def fire_webhook(
     timeout: float,
     max_attempts: int,
 ) -> None:
-    # Best-effort: webhook failure never affects the job's delivery status (DESIGN.md §8).
+    """POST a status-change notification to the job's callback URL.
+
+    Best-effort: webhook failure never affects the job's delivery status
+    (DESIGN.md §8).  Up to ``max_attempts`` are tried with exponential
+    backoff, and every attempt is logged to ``webhook_log``.
+    """
     if not callback_url:
         return
     payload = {

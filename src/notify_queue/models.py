@@ -1,3 +1,5 @@
+"""Pydantic models and type aliases for the job scheduling API."""
+
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -9,6 +11,12 @@ JobStatus = Literal["pending", "queued", "claimed", "sent", "failed", "dead_lett
 
 
 class JobCreate(BaseModel):
+    """Request body for ``POST /jobs``.
+
+    ``send_at`` and ``delay_seconds`` are mutually exclusive; ``delay_seconds``
+    resolves to ``NOW() + delay``.
+    """
+
     recipient: str = Field(min_length=1)
     channel: Channel
     payload: dict[str, Any]
@@ -21,17 +29,20 @@ class JobCreate(BaseModel):
     @field_validator("send_at")
     @classmethod
     def _assume_utc(cls, value: datetime | None) -> datetime | None:
+        """Treat naive datetimes as UTC."""
         if value is not None and value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
 
     @model_validator(mode="after")
     def _mutually_exclusive_schedule(self) -> "JobCreate":
+        """Reject requests that specify both ``send_at`` and ``delay_seconds``."""
         if self.send_at is not None and self.delay_seconds is not None:
             raise ValueError("send_at and delay_seconds are mutually exclusive")
         return self
 
     def resolved_send_at(self) -> datetime:
+        """Return the effective delivery time, defaulting to now."""
         if self.send_at is not None:
             return self.send_at
         if self.delay_seconds is not None:

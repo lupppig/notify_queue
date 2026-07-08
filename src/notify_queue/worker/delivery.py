@@ -1,3 +1,5 @@
+"""Job delivery pipeline: fetch, rate-limit check, deliver, and handle outcomes."""
+
 import asyncio
 import logging
 import random
@@ -53,6 +55,12 @@ async def process_job(
     worker_id: str,
     settings: Settings,
 ) -> None:
+    """Run delivery for a single job with a concurrent heartbeat.
+
+    A background heartbeat task updates ``heartbeat_at`` every interval while
+    the delivery executes.  The heartbeat is cancelled once delivery completes
+    (successfully or not).
+    """
     stop = asyncio.Event()
     heartbeat = asyncio.create_task(
         heartbeat_loop(pool, job_id, worker_id, stop, settings.heartbeat_interval_seconds)
@@ -67,10 +75,13 @@ async def process_job(
 async def execute_delivery(
     pool: asyncpg.Pool, redis_client: redis.Redis, job_id: uuid.UUID, settings: Settings
 ) -> None:
+    """Fetch the job, enforce the rate limit, and attempt delivery.
+
+    Rate limiting happens at delivery time: a rate-limited job is deferred
+    to the next window, never failed (DESIGN.md §9).
+    """
     job = await pool.fetchrow(FETCH_JOB, job_id)
 
-    # Rate limiting happens at delivery time: a rate-limited job is deferred
-    # to the next window, never failed (DESIGN.md §9).
     allowed, retry_after_seconds = await check_rate_limit(
         redis_client, job["recipient"], settings.rate_limit_per_hour
     )
@@ -88,6 +99,7 @@ async def execute_delivery(
 async def handle_success(
     pool: asyncpg.Pool, redis_client: redis.Redis, job: asyncpg.Record, settings: Settings
 ) -> None:
+    """Mark the job as sent (fenced), release its Redis lock, and fire the webhook."""
     updated = await pool.fetchrow(MARK_SENT, job["id"], job["worker_id"])
     if updated is None:
         logger.warning("job %s no longer owned; skipping sent transition", job["id"])
@@ -110,6 +122,11 @@ async def handle_failure(
     error: str,
     settings: Settings,
 ) -> None:
+    """Schedule an exponential-backoff retry, or dead-letter if attempts are exhausted.
+
+    Resetting ``send_at`` routes the retry through the scheduler's normal
+    promotion path — no separate retry queue (DESIGN.md §7.6).
+    """
     attempt = job["attempt_count"] + 1
     if attempt >= job["max_attempts"]:
         await dead_letter(
@@ -125,8 +142,6 @@ async def handle_failure(
 
     delay = settings.base_retry_delay_seconds * 2 ** (attempt - 1)
     next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
-    # Resetting send_at routes the retry through the scheduler's normal
-    # promotion path — no separate retry queue (DESIGN.md §7.6).
     updated = await pool.fetchrow(
         SCHEDULE_RETRY, attempt, next_retry_at, error, job["id"], job["worker_id"]
     )
@@ -150,7 +165,12 @@ async def defer_job(
     job: asyncpg.Record,
     retry_after_seconds: int,
 ) -> None:
-    # Deferral is not a failure: attempt_count is untouched and no webhook fires.
+    """Defer a rate-limited job to the next hourly window.
+
+    Deferral is not a failure: ``attempt_count`` is untouched and no webhook
+    fires.  The job returns to ``pending`` with ``send_at`` at the top of the
+    next window.
+    """
     next_window = datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
     updated = await pool.fetchrow(DEFER_TO_NEXT_WINDOW, next_window, job["id"], job["worker_id"])
     if updated is None:

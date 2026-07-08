@@ -1,3 +1,5 @@
+"""Task scheduler: promotes due jobs, recovers stale claims, and requeues lost jobs."""
+
 import uuid
 from datetime import datetime
 
@@ -46,10 +48,17 @@ LIMIT $2
 
 
 def priority_score(priority: str, send_at: datetime) -> float:
+    """Compute a composite Redis sorted-set score: priority weight plus Unix timestamp.
+
+    A high-priority job always scores below a lower-priority one; within a
+    priority tier, earlier ``send_at`` wins.  Workers use ``ZPOPMIN`` (lowest
+    score first).
+    """
     return PRIORITY_WEIGHTS[priority] + send_at.timestamp()
 
 
 async def _enqueue(redis_client: redis.Redis, rows: list[asyncpg.Record]) -> None:
+    """ZADD a batch of jobs into their priority queues via a Redis pipeline."""
     pipe = redis_client.pipeline()
     for row in rows:
         score = priority_score(row["priority"], row["send_at"])
@@ -60,6 +69,11 @@ async def _enqueue(redis_client: redis.Redis, rows: list[asyncpg.Record]) -> Non
 async def promote_due_jobs(
     pool: asyncpg.Pool, redis_client: redis.Redis, settings: Settings
 ) -> list[uuid.UUID]:
+    """Atomically mark due ``pending`` jobs as ``queued`` and enqueue them in Redis.
+
+    Uses ``FOR UPDATE SKIP LOCKED`` so multiple scheduler instances grab
+    non-overlapping batches.
+    """
     rows = await pool.fetch(
         PROMOTE_DUE_JOBS, settings.scheduler_lookahead_seconds, settings.scheduler_batch_size
     )
@@ -71,8 +85,11 @@ async def promote_due_jobs(
 async def recover_stale_claimed_jobs(
     pool: asyncpg.Pool, redis_client: redis.Redis, settings: Settings
 ) -> list[uuid.UUID]:
-    # The reclaim counts as a failed attempt: a hard-crashed worker never runs
-    # handle_failure, so this increment is what dead-letters poison messages.
+    """Reclaim jobs whose workers have missed the heartbeat timeout.
+
+    The reclaim counts as a failed attempt: a hard-crashed worker never runs
+    ``handle_failure``, so this increment is what dead-letters poison messages.
+    """
     rows = await pool.fetch(RECOVER_STALE_CLAIMED, settings.heartbeat_timeout_seconds)
     for job in rows:
         await redis_client.delete(f"job:lock:{job['id']}")
@@ -92,9 +109,12 @@ async def recover_stale_claimed_jobs(
 async def requeue_stale_queued_jobs(
     pool: asyncpg.Pool, redis_client: redis.Redis, settings: Settings
 ) -> list[uuid.UUID]:
-    # Rescues jobs marked 'queued' that never reached Redis (scheduler crash
-    # between the status update and ZADD, or Redis data loss — DESIGN.md §10.4).
-    # ZADD is idempotent per member, so re-adding a job still in the queue is a no-op.
+    """Rescue jobs marked ``queued`` that never reached Redis.
+
+    This covers a scheduler crash between the status update and ZADD, or Redis
+    data loss (DESIGN.md §10.4).  ZADD is idempotent per member, so re-adding
+    a job still in the queue is a no-op.
+    """
     rows = await pool.fetch(
         REQUEUE_STALE_QUEUED, settings.queued_requeue_seconds, settings.scheduler_batch_size
     )

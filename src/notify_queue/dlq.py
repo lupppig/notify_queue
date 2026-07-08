@@ -1,3 +1,5 @@
+"""Dead-letter queue: terminal handling for jobs that exhaust their retry budget."""
+
 import logging
 
 import asyncpg
@@ -34,8 +36,12 @@ async def dead_letter(
     *,
     expected_worker_id: str | None,
 ) -> None:
-    # Status update and DLQ insert commit together so a job can never be
-    # marked dead_lettered without a matching DLQ row (DESIGN.md §7.7).
+    """Move a job to the dead-letter queue and fire the ``dead_lettered`` webhook.
+
+    The status update and DLQ insert commit in a single transaction so a job
+    can never be marked ``dead_lettered`` without a matching DLQ row
+    (DESIGN.md §7.7).
+    """
     async with pool.acquire() as conn, conn.transaction():
         marked = await conn.fetchrow(
             MARK_DEAD_LETTERED, error, job["id"], attempt_count, expected_worker_id

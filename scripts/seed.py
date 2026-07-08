@@ -1,5 +1,8 @@
+"""Seed the database with realistic job data across all lifecycle states."""
+
 import argparse
 import asyncio
+import logging
 import random
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -8,6 +11,9 @@ import asyncpg
 
 from notify_queue.config import Settings
 from notify_queue.db import create_pool
+from notify_queue.log import setup_logging
+
+logger = logging.getLogger("notify_queue.seed")
 
 CHANNELS = ("email", "sms", "push")
 PRIORITIES = ("high", "medium", "low")
@@ -48,6 +54,8 @@ INSERT INTO job_idempotency (idempotency_key, job_id) VALUES ($1, $2)
 
 
 class Seeder:
+    """Generate and insert realistic job records across all lifecycle states."""
+
     def __init__(self, pool: asyncpg.Pool, rng: random.Random) -> None:
         self.pool = pool
         self.rng = rng
@@ -55,6 +63,7 @@ class Seeder:
         self.sequence = 0
 
     async def run(self, total: int) -> None:
+        """Insert *total* jobs split proportionally across statuses."""
         shares = {
             "sent": 0.50,
             "pending_future": 0.15,
@@ -68,9 +77,10 @@ class Seeder:
             seed = getattr(self, f"seed_{kind}")
             for _ in range(count):
                 await seed()
-        print("seeded: " + " ".join(f"{kind}={count}" for kind, count in counts.items()))
+        logger.info("seeded: %s", " ".join(f"{kind}={count}" for kind, count in counts.items()))
 
     def base_job(self) -> dict:
+        """Return a randomised job template."""
         self.sequence += 1
         channel = self.rng.choice(CHANNELS)
         return {
@@ -85,6 +95,7 @@ class Seeder:
         }
 
     def payload_for(self, channel: str) -> dict:
+        """Return a channel-appropriate payload body."""
         n = self.sequence
         if channel == "email":
             return {"subject": f"Order #{1000 + n} confirmed", "body": "Thanks for your order."}
@@ -93,6 +104,7 @@ class Seeder:
         return {"title": "Package update", "body": f"Shipment #{1000 + n} is out for delivery"}
 
     async def insert(self, job: dict, **overrides) -> uuid.UUID:
+        """Insert a job row with optional field overrides and a random idempotency key."""
         row = {
             "status": "pending",
             "send_at": job["created_at"],
@@ -132,6 +144,7 @@ class Seeder:
         return job_id
 
     async def log_webhook(self, job_id: uuid.UUID, job: dict, status: str, at: datetime) -> None:
+        """Record a synthetic webhook delivery for audit trail realism."""
         if not job["callback_url"]:
             return
         payload = {"job_id": str(job_id), "status": status, "timestamp": at.isoformat()}
@@ -140,6 +153,7 @@ class Seeder:
         )
 
     async def seed_sent(self) -> None:
+        """Create a successfully delivered job."""
         job = self.base_job()
         sent_at = job["created_at"] + timedelta(seconds=self.rng.randint(1, 300))
         job_id = await self.insert(
@@ -151,10 +165,12 @@ class Seeder:
         await self.log_webhook(job_id, job, "sent", sent_at)
 
     async def seed_pending_future(self) -> None:
+        """Create a job scheduled for future delivery."""
         job = self.base_job()
         await self.insert(job, send_at=self.now + timedelta(minutes=self.rng.randint(10, 48 * 60)))
 
     async def seed_retrying(self) -> None:
+        """Create a job mid-retry with exponential backoff."""
         job = self.base_job()
         attempt = self.rng.randint(1, 3)
         next_retry = self.now + timedelta(seconds=30 * 2 ** (attempt - 1))
@@ -167,10 +183,12 @@ class Seeder:
         )
 
     async def seed_queued(self) -> None:
+        """Create a job sitting in the queued state."""
         job = self.base_job()
         await self.insert(job, status="queued", send_at=self.now)
 
     async def seed_claimed(self) -> None:
+        """Create a job currently claimed by a worker."""
         job = self.base_job()
         await self.insert(
             job,
@@ -182,6 +200,7 @@ class Seeder:
         )
 
     async def seed_dead_lettered(self) -> None:
+        """Create a dead-lettered job with a matching DLQ row and webhook log."""
         job = self.base_job()
         error = self.rng.choice(ERRORS)
         failed_at = job["created_at"] + timedelta(minutes=self.rng.randint(10, 60))
@@ -199,6 +218,7 @@ class Seeder:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the seeder."""
     parser = argparse.ArgumentParser(description="Seed the database with realistic job data")
     parser.add_argument("--total", type=int, default=100)
     parser.add_argument("--wipe", action="store_true", help="truncate all tables first")
@@ -207,15 +227,17 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main() -> None:
+    """Entry point: set up logging, connect to the database, and run the seeder."""
+    setup_logging("seed")
     args = parse_args()
     pool = await create_pool(Settings().database_url)
     try:
         if args.wipe:
             await pool.execute("TRUNCATE webhook_log, dead_letter_queue, job_idempotency, jobs")
-            print("wiped existing data")
+            logger.info("wiped existing data")
         await Seeder(pool, random.Random(args.seed)).run(args.total)
         rows = await pool.fetch("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status")
-        print("database now: " + " ".join(f"{r['status']}={r['count']}" for r in rows))
+        logger.info("database now: %s", " ".join(f"{r['status']}={r['count']}" for r in rows))
     finally:
         await pool.close()
 
