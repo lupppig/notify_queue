@@ -15,7 +15,7 @@ Build a distributed notification delivery system that:
 - Supports priority ordering (high jobs always before low)
 - Retries failed jobs with exponential backoff
 - Dead-letters jobs that exhaust retries
-- Rate-limits notifications per recipient per hour
+- Rate-limits notifications per recipient per hour (excess jobs are deferred, never rejected)
 - Fires webhook callbacks on every status change
 - Exposes job status and system metrics endpoints
 - Scales horizontally without coordination overhead
@@ -54,14 +54,12 @@ The scheduler is the clock. The workers are the hands.
 │  GET /metrics          POST /webhook-mock (stub receiver)  │
 └───────────┬─────────────────────────────────────────────────┘
             │
-     ┌──────▼──────┐        ┌─────────────────┐
-     │  Idempotency │        │   Rate Limiter  │
-     │  Check (PG)  │        │  (Redis INCR)   │
-     └──────┬──────┘        └────────┬────────┘
-            │                        │
-            └───────────┬────────────┘
-                        │ write job → PostgreSQL
-                        ▼
+     ┌──────▼──────┐
+     │  Idempotency │
+     │  Check (PG)  │
+     └──────┬──────┘
+            │ write job → PostgreSQL
+            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    PostgreSQL (job store)                   │
 │  jobs · job_idempotency · dead_letter_queue · webhook_log  │
@@ -84,7 +82,8 @@ The scheduler is the clock. The workers are the hands.
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              Worker Pool (N instances)                      │
-│  Heartbeat · Distributed lock · Delivery stub · Retry DLQ  │
+│  Heartbeat · Distributed lock · Rate limiter (Redis INCR)  │
+│  Delivery stub · Retry · DLQ · Defer when rate-limited     │
 └───────────┬─────────────────────────────────────────────────┘
             │ status change
             ▼
@@ -197,7 +196,7 @@ CREATE TABLE webhook_log (
 
 ### 4.5 rate_limit_buckets (Redis, not PostgreSQL)
 
-Rate limiting state lives in Redis only, not PostgreSQL. A rate limit bucket is ephemeral: if Redis restarts, rate limit counts reset. This is acceptable because the consequence is a brief window of over-delivery, not data loss. Using PostgreSQL for rate limit state would add a write on every job submission and every delivery, which is the hottest path in the system.
+Rate limiting state lives in Redis only, not PostgreSQL. A rate limit bucket is ephemeral: if Redis restarts, rate limit counts reset. This is acceptable because the consequence is a brief window of over-delivery, not data loss. Using PostgreSQL for rate limit state would add a write on every delivery attempt, which is the hottest path in the system.
 
 ```
 Key pattern: ratelimit:{recipient}:{YYYYMMDDHH}
@@ -247,13 +246,7 @@ Schedule a notification job.
 }
 ```
 
-**Response 429 (rate limit exceeded):**
-```json
-{
-    "error": "rate_limit_exceeded",
-    "retry_after_seconds": 1800
-}
-```
+**Note on rate limiting:** `POST /jobs` never returns 429. Rate limiting is enforced at delivery time (see Section 9): if a recipient's hourly budget is exhausted when the job comes due, the worker defers the job to the next window instead of failing it. Excess jobs queue, they do not fail.
 
 ### GET /jobs/{job_id}/status
 
@@ -355,22 +348,33 @@ The score is a composite: priority weight (an offset) plus the Unix timestamp. A
 
 ```python
 async def recover_stale_claimed_jobs():
-    # A claimed job with no heartbeat for 30 seconds means the worker died
+    # A claimed job with no heartbeat for 30 seconds means the worker died.
+    # The reclaim counts as a failed attempt: this is what eventually
+    # dead-letters poison messages that crash workers (see 10.10).
     stale_jobs = await db.fetch("""
         UPDATE jobs
         SET status = 'pending',
+            attempt_count = attempt_count + 1,
+            error_message = 'worker died mid-processing (heartbeat timeout)',
             worker_id = NULL,
             claimed_at = NULL,
             heartbeat_at = NULL,
             updated_at = NOW()
         WHERE status = 'claimed'
           AND heartbeat_at < NOW() - INTERVAL '30 seconds'
-        RETURNING id
+        RETURNING id, recipient, channel, payload, attempt_count,
+                  max_attempts, callback_url
     """)
-    # These jobs will be re-promoted on the next scheduler loop iteration
+    # Jobs still under the retry cap are re-promoted on the next loop
+    # iteration. Jobs that exhausted the cap are dead-lettered instead.
+    for job in stale_jobs:
+        if job['attempt_count'] >= job['max_attempts']:
+            await dead_letter(job, job['error_message'])
 ```
 
 **Why reset to `pending` instead of `queued`?** Resetting to `pending` lets the scheduler re-evaluate whether the job is still due and re-enqueue it cleanly. Jumping directly to `queued` and re-adding to Redis risks double-enqueue if the job is somehow still in the Redis queue from the dead worker's earlier claim.
+
+**Why increment `attempt_count` on reclaim?** The worker-side failure handler (`handle_failure`, Section 7.6) never runs if the worker process crashes outright. If the reclaim did not count as an attempt, a poison message that crashes every worker that touches it would be reclaimed and retried forever. Counting the reclaim as an attempt makes the `max_attempts` cap the circuit breaker even for hard crashes — after enough reclaims, the scheduler dead-letters the job directly.
 
 ---
 
@@ -478,6 +482,13 @@ import random
 async def execute_delivery(job_id: str, worker_id: str):
     job = await db.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
     
+    # Rate limit check happens here, at delivery time, not at submission.
+    # A rate-limited job is deferred to the next window, never failed.
+    allowed, retry_after_seconds = await check_rate_limit(job['recipient'])
+    if not allowed:
+        await defer_job(job, retry_after_seconds)
+        return
+    
     # Simulate configurable failure rate
     failure_rate = float(os.environ.get("DELIVERY_FAILURE_RATE", "0.1"))
     delivery_failed = random.random() < failure_rate
@@ -516,8 +527,9 @@ async def handle_failure(job: dict, error: str, worker_id: str):
         await dead_letter(job, error)
         return
     
-    # Exponential backoff: 30s, 60s, 120s, 240s, 480s
-    delay = BASE_DELAY_SECONDS * (2 ** attempt)
+    # Exponential backoff: 30s, 60s, 120s, 240s (attempts 1-4;
+    # attempt 5 dead-letters instead of retrying)
+    delay = BASE_DELAY_SECONDS * (2 ** (attempt - 1))
     next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
     
     await db.execute("""
@@ -613,6 +625,10 @@ Webhook delivery is best-effort with 3 retries and exponential backoff. A failed
 
 ## 9. Rate Limiting
 
+Rate limiting is enforced at **delivery time in the worker**, not at submission time in the API. A job for a rate-limited recipient is never rejected and never fails — it is deferred to the next hourly window and flows back through the normal scheduling path.
+
+**Why not check at the API?** Two reasons. First, the requirement: excess jobs must queue, not fail. A 429 at submission is a failure from the client's perspective. Second, correctness: a job submitted at 10:59 for delivery at 14:00 would be judged against the 10:00-11:00 window — the wrong window entirely. Only at delivery time is it known which window the send actually falls into.
+
 ```python
 MAX_NOTIFICATIONS_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "10"))
 
@@ -644,6 +660,32 @@ async def check_rate_limit(recipient: str) -> tuple[bool, int]:
 
 **Why decrement on limit exceeded?** We increment first to check atomically. If the limit is exceeded, we decrement to undo the increment. This is simpler than a check-then-increment pattern and avoids a race where two concurrent requests both read below the limit and both proceed.
 
+### 9.1 Deferring a Rate-Limited Job
+
+```python
+async def defer_job(job: dict, retry_after_seconds: int):
+    # Deferral is not a failure: attempt_count is NOT incremented and
+    # no 'failed' webhook fires. The job simply moves to the next window.
+    next_window = datetime.utcnow() + timedelta(seconds=retry_after_seconds)
+    
+    await db.execute("""
+        UPDATE jobs
+        SET status = 'pending',
+            send_at = $1,
+            worker_id = NULL,
+            claimed_at = NULL,
+            heartbeat_at = NULL,
+            updated_at = NOW()
+        WHERE id = $2
+    """, next_window, job['id'])
+    
+    await redis.delete(f"job:lock:{job['id']}")
+```
+
+Deferral reuses the exact mechanism retries use (Section 7.6): reset `send_at`, return the job to `pending`, and let the scheduler re-promote it when the next window opens. The scheduler remains the only component that decides when a job enters the Redis queue.
+
+If many jobs for the same recipient defer into the same next window, they are promoted in priority-then-`send_at` order and consume that window's budget in order; whatever exceeds the budget again defers to the window after. The queue drains at the rate limit, which is the required behavior.
+
 ---
 
 ## 10. Edge Cases and How We Handle Each
@@ -667,7 +709,7 @@ The scheduler uses a 5-second lookahead. Jobs scheduled for exactly `NOW()` are 
 Two requests arrive with the same idempotency key at the same millisecond. Both attempt to insert into `job_idempotency`. PostgreSQL's primary key constraint rejects the second insert with a unique violation. The API returns 409 for the second request. The first request proceeds normally. No race, no duplicate job.
 
 ### 10.7 Rate limit window boundary
-At 10:59:59 a recipient has 9/10 notifications used. At 11:00:00 the window rolls over and the counter resets. They can send 10 more. The sliding window key `ratelimit:{recipient}:{YYYYMMDDHH}` changes at the hour boundary. The previous key expires after 2 hours and is cleaned up by Redis TTL.
+At 10:59:59 a recipient has 9/10 notifications used. At 11:00:00 the window rolls over and the counter resets. They can send 10 more. The fixed-window key `ratelimit:{recipient}:{YYYYMMDDHH}` changes at the hour boundary. The previous key expires after 2 hours and is cleaned up by Redis TTL. Jobs that were deferred because the 10:00 window was full have `send_at` inside the 11:00 window and are promoted by the scheduler as soon as it opens.
 
 ### 10.8 Webhook receiver is down
 The webhook dispatcher retries 3 times with backoff. If all 3 attempts fail, the failure is logged to `webhook_log` and the dispatcher moves on. The job's delivery status is not affected. The caller can query `GET /jobs/{id}/status` to see the current state.
@@ -676,7 +718,10 @@ The webhook dispatcher retries 3 times with backoff. If all 3 attempts fail, the
 The scheduler enqueues the job to `queue:high`. Workers poll `queue:high` first on every loop iteration. As soon as any worker finishes its current job, it picks up the high-priority job next. The job waits in the queue until a worker is free. This is the correct behavior: priority determines queue order, not execution latency.
 
 ### 10.10 Poison message (job that always crashes the worker process)
-The heartbeat stops on worker crash. The scheduler reclaims the job. Another worker claims it and crashes. This repeats until `attempt_count >= MAX_ATTEMPTS`, at which point the job is dead-lettered. The `max_attempts` cap is the poison message circuit breaker. After dead-lettering, no worker ever processes the job again.
+The heartbeat stops on worker crash. The scheduler reclaims the job and increments `attempt_count` (Section 6.3) — this is essential, because a hard crash means the worker-side failure handler never runs, so the reclaim itself must count as the failed attempt. Another worker claims it and crashes; the cycle repeats until `attempt_count >= max_attempts`, at which point the scheduler's recovery path dead-letters the job directly. The `max_attempts` cap is the poison message circuit breaker. After dead-lettering, no worker ever processes the job again.
+
+### 10.11 Rate-limited recipient with a burst of due jobs
+Twenty jobs for the same recipient all come due at 10:00 with a limit of 10/hour. Workers deliver the first 10; each of the remaining 10 fails its rate limit check at delivery time and is deferred (Section 9.1) — `send_at` moves to 11:00, `attempt_count` untouched. At 11:00 the scheduler re-promotes them, 10 deliver, and any excess rolls to 12:00. No job is rejected, no retry budget is consumed, and the backlog drains at exactly the permitted rate.
 
 ---
 
@@ -696,7 +741,9 @@ The heartbeat stops on worker crash. The scheduler reclaims the job. Another wor
 
 **Multiple scheduler instances:** Run two schedulers in active-passive mode. Both run, but `FOR UPDATE SKIP LOCKED` ensures they do not promote the same job. If one scheduler is slow or restarting, the other continues without interruption.
 
-## 13. Environment Variables
+---
+
+## 12. Environment Variables
 
 ```env
 DATABASE_URL=postgresql://user:pass@localhost:5432/notifications
@@ -713,7 +760,7 @@ WORKER_COUNT=4
 
 ---
 
-## 14. Running the System
+## 13. Running the System
 
 ```bash
 # Start infrastructure
