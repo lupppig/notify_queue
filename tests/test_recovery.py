@@ -76,9 +76,16 @@ async def test_zombie_worker_cannot_mark_a_reclaimed_job_sent(pool, redis, setti
 async def test_zombie_worker_cannot_reschedule_a_reclaimed_job(pool, redis, settings):
     job_id, stale_view = await stale_claim(pool)
     await handle_failure(pool, redis, stale_view, "late failure", settings)
-    row = await pool.fetchrow("SELECT status, attempt_count FROM jobs WHERE id = $1", job_id)
+    row = await pool.fetchrow(
+        "SELECT status, attempt_count, next_retry_at, error_message FROM jobs WHERE id = $1",
+        job_id,
+    )
     assert row["status"] == "pending"
     assert row["attempt_count"] == 1
+    # The reclaim path leaves both NULL; an unfenced SCHEDULE_RETRY would have
+    # set them, so NULL is what proves the fence held.
+    assert row["next_retry_at"] is None
+    assert row["error_message"] is None
 
 
 async def test_zombie_worker_cannot_dead_letter_a_reclaimed_job(pool, redis, settings):
