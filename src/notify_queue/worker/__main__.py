@@ -27,13 +27,20 @@ async def worker_loop(
 ) -> None:
     logger.info("%s started", worker_id)
     while not stop.is_set():
-        job_id = await claim_next_job(pool, redis_client, worker_id, settings)
-        if job_id is None:
+        try:
+            job_id = await claim_next_job(pool, redis_client, worker_id, settings)
+            if job_id is None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=settings.worker_idle_sleep_seconds)
+                continue
+            logger.info("%s processing %s", worker_id, job_id)
+            await process_job(pool, redis_client, job_id, worker_id, settings)
+        except Exception:
+            # A transient failure must not kill the worker. An abandoned claim
+            # is recovered by the scheduler via the heartbeat timeout.
+            logger.exception("%s: iteration failed", worker_id)
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=settings.worker_idle_sleep_seconds)
-            continue
-        logger.info("%s processing %s", worker_id, job_id)
-        await process_job(pool, redis_client, job_id, worker_id, settings)
+                await asyncio.wait_for(stop.wait(), timeout=settings.error_backoff_seconds)
     logger.info("%s stopped", worker_id)
 
 

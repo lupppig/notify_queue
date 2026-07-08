@@ -252,7 +252,9 @@ async function submitJob(event) {
     } else if (res.status === 409) {
       toast(`duplicate idempotency key — existing job ${shortId(data.existing_job_id)}`, "warn");
     } else if (res.status === 422) {
-      const detail = (data.detail ?? []).map((d) => d.msg).join("; ");
+      const detail = Array.isArray(data.detail)
+        ? data.detail.map((d) => d.msg).join("; ")
+        : String(data.detail ?? "");
       $("#form-error").textContent = detail || "invalid request";
     } else {
       toast(`unexpected error ${res.status}`, "bad");
@@ -276,9 +278,14 @@ async function onDlqClick(event) {
   const id = event.target.dataset.retry;
   if (!id) return;
   event.target.disabled = true;
-  toast((await retryJob(id)) ? `requeued ${shortId(id)}` : `could not retry ${shortId(id)}`,
-    "ok");
-  refresh();
+  try {
+    const ok = await retryJob(id);
+    toast(ok ? `requeued ${shortId(id)}` : `could not retry ${shortId(id)}`, ok ? "ok" : "bad");
+  } catch {
+    toast(`could not retry ${shortId(id)}`, "bad");
+  } finally {
+    refresh();
+  }
 }
 
 async function retryAll() {

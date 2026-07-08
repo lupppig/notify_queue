@@ -13,7 +13,7 @@ class JobCreate(BaseModel):
     channel: Channel
     payload: dict[str, Any]
     send_at: datetime | None = None
-    delay_seconds: int | None = Field(default=None, ge=0)
+    delay_seconds: int | None = Field(default=None, ge=0, le=366 * 24 * 3600)
     priority: Priority = "medium"
     callback_url: str | None = None
     idempotency_key: str | None = Field(default=None, min_length=1)

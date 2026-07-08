@@ -12,6 +12,11 @@ async def test_delay_seconds_resolves_relative_send_at(submit):
     assert res.json()["status"] == "pending"
 
 
+async def test_absurd_delay_is_rejected_not_500(submit):
+    res = await submit(delay_seconds=10**20)
+    assert res.status_code == 422
+
+
 async def test_unknown_job_returns_404(client):
     res = await client.get(f"/jobs/{uuid.uuid4()}/status")
     assert res.status_code == 404

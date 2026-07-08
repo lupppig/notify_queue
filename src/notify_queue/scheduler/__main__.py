@@ -29,16 +29,21 @@ async def main() -> None:
     logger.info("scheduler started, polling every %dms", settings.scheduler_poll_interval_ms)
     try:
         while not stop.is_set():
-            promoted = await promote_due_jobs(pool, redis_client, settings)
-            recovered = await recover_stale_claimed_jobs(pool, redis_client, settings)
-            requeued = await requeue_stale_queued_jobs(pool, redis_client, settings)
-            if promoted or recovered or requeued:
-                logger.info(
-                    "promoted=%d recovered=%d requeued=%d",
-                    len(promoted),
-                    len(recovered),
-                    len(requeued),
-                )
+            try:
+                promoted = await promote_due_jobs(pool, redis_client, settings)
+                recovered = await recover_stale_claimed_jobs(pool, redis_client, settings)
+                requeued = await requeue_stale_queued_jobs(pool, redis_client, settings)
+                if promoted or recovered or requeued:
+                    logger.info(
+                        "promoted=%d recovered=%d requeued=%d",
+                        len(promoted),
+                        len(recovered),
+                        len(requeued),
+                    )
+            except Exception:
+                # The scheduler is the one process the system cannot lose;
+                # a failed tick is retried on the next poll interval.
+                logger.exception("scheduler tick failed")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop.wait(), timeout=settings.scheduler_poll_interval_ms / 1000

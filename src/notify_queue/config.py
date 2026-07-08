@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     heartbeat_timeout_seconds: float = 30
     worker_count: int = 4
     worker_idle_sleep_seconds: float = 0.1
+    error_backoff_seconds: float = 1.0
     job_lock_ttl_seconds: int = 60
     webhook_timeout_seconds: float = 5.0
     webhook_max_attempts: int = 3
