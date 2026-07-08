@@ -1,0 +1,113 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --purple: #bc8cff;
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 16px;
+}
+
+h1 { font-size: 16px; font-weight: 600; }
+
+h2 {
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.conn.ok { color: var(--green); }
+.conn.down { color: var(--red); }
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.tile {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+}
+
+.tile .n { font-size: 20px; }
+.tile .l { color: var(--muted); font-size: 11px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+table { width: 100%; border-collapse: collapse; }
+
+th, td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+
+th { color: var(--muted); font-weight: 400; }
+tbody tr:last-child td { border-bottom: none; }
+
+tr.flash { animation: flash .8s ease-out; }
+@keyframes flash { from { background: #1c2a3a; } }
+
+.status-pending { color: var(--muted); }
+.status-queued { color: var(--blue); }
+.status-claimed { color: var(--purple); }
+.status-sent { color: var(--green); }
+.status-failed { color: var(--yellow); }
+.status-dead_lettered { color: var(--red); }
+
+form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+input, select, button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  font: inherit;
+}
+
+input.wide { min-width: 260px; }
+input:focus, select:focus { outline: 1px solid var(--blue); }
+
+button { cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:disabled { opacity: .5; cursor: default; }
+
+#form-msg { color: var(--muted); }
+
+.empty { color: var(--muted); padding: 4px 8px; }

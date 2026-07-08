@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>notify_queue</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>notify_queue</h1>
+  <span id="conn" class="conn ok">connected</span>
+</header>
+
+<section id="metrics" class="metrics"></section>
+
+<section class="panel">
+  <h2>schedule job</h2>
+  <form id="job-form">
+    <input name="recipient" placeholder="recipient" required>
+    <select name="channel">
+      <option>email</option><option>sms</option><option>push</option>
+    </select>
+    <select name="priority">
+      <option>high</option><option selected>medium</option><option>low</option>
+    </select>
+    <input name="delay_seconds" type="number" min="0" value="0" title="delay in seconds">
+    <input name="payload" class="wide" value='{"subject":"hello","body":"world"}' title="JSON payload">
+    <input name="callback_url" class="wide" placeholder="callback url (optional)">
+    <input name="idempotency_key" placeholder="idempotency key (optional)">
+    <button type="submit">submit</button>
+    <span id="form-msg"></span>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>jobs</h2>
+  <table id="jobs">
+    <thead><tr>
+      <th>id</th><th>recipient</th><th>channel</th><th>priority</th>
+      <th>status</th><th>attempts</th><th>send at</th><th>updated</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>dead letters</h2>
+  <table id="dlq">
+    <thead><tr>
+      <th>id</th><th>recipient</th><th>channel</th><th>attempts</th><th>last error</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>
