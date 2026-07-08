@@ -23,6 +23,7 @@ Dashboard: **http://127.0.0.1:8080** — submit jobs, watch statuses live, view 
 make test       # run the test suite
 make seed       # wipe and fill the database with realistic data
 make simulate   # drive the running system end to end
+make migrate    # apply the schema migration
 make lint       # style checks
 make reset      # empty tables and queues
 make help       # everything else
