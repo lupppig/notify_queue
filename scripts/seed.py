@@ -152,9 +152,7 @@ class Seeder:
 
     async def seed_pending_future(self) -> None:
         job = self.base_job()
-        await self.insert(
-            job, send_at=self.now + timedelta(minutes=self.rng.randint(10, 48 * 60))
-        )
+        await self.insert(job, send_at=self.now + timedelta(minutes=self.rng.randint(10, 48 * 60)))
 
     async def seed_retrying(self) -> None:
         job = self.base_job()

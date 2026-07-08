@@ -28,9 +28,7 @@ async def fail_until_dead(pool, redis, settings, max_attempts):
         await execute_delivery(pool, redis, job_id, settings)
         row = await pool.fetchrow("SELECT status, send_at FROM jobs WHERE id = $1", job_id)
         if row["status"] == "pending":
-            await asyncio.sleep(
-                max(0.0, (row["send_at"] - datetime.now(UTC)).total_seconds())
-            )
+            await asyncio.sleep(max(0.0, (row["send_at"] - datetime.now(UTC)).total_seconds()))
     return job_id
 
 
