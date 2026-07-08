@@ -43,8 +43,6 @@ h2 {
 .conn.ok { color: var(--green); }
 .conn.down { color: var(--red); }
 
-/* ── metrics ──────────────────────────────────────────────── */
-
 .metrics {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
@@ -84,8 +82,6 @@ h2 {
 .bar-failed { background: var(--yellow); }
 .bar-dead_lettered { background: var(--red); }
 
-/* ── panels & layout ──────────────────────────────────────── */
-
 .columns {
   display: grid;
   grid-template-columns: 360px 1fr;
@@ -111,8 +107,6 @@ h2 {
   align-items: baseline;
   gap: 8px;
 }
-
-/* ── form ─────────────────────────────────────────────────── */
 
 .field { margin-bottom: 12px; }
 
@@ -183,8 +177,6 @@ button.primary:hover { background: #21395a; }
 
 .error { color: var(--red); font-size: 12px; }
 
-/* ── tables ───────────────────────────────────────────────── */
-
 table { width: 100%; border-collapse: collapse; }
 
 th, td {
@@ -211,8 +203,6 @@ tr.flash { animation: flash .8s ease-out; }
 .status-dead_lettered { color: var(--red); }
 
 .empty { color: var(--muted); padding: 4px 8px; }
-
-/* ── toast ────────────────────────────────────────────────── */
 
 .toast {
   position: fixed;

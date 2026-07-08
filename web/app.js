@@ -24,8 +24,6 @@ const state = {
   scheduleMode: "now",
 };
 
-/* ── api ──────────────────────────────────────────────────── */
-
 async function request(path, options = {}, retries = 3) {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -49,8 +47,6 @@ function setConnected(ok) {
   conn.textContent = ok ? "connected" : "disconnected";
   conn.className = `conn ${ok ? "ok" : "down"}`;
 }
-
-/* ── rendering ────────────────────────────────────────────── */
 
 const esc = (value) =>
   String(value ?? "").replace(/[&<>"']/g, (c) =>
@@ -135,8 +131,6 @@ async function refresh() {
   }
 }
 
-/* ── toast ────────────────────────────────────────────────── */
-
 let toastTimer;
 function toast(message, kind = "ok") {
   const el = $("#toast");
@@ -146,8 +140,6 @@ function toast(message, kind = "ok") {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (el.hidden = true), 4000);
 }
-
-/* ── form ─────────────────────────────────────────────────── */
 
 function segmented(el, onChange) {
   el.addEventListener("click", (e) => {
@@ -267,8 +259,6 @@ async function submitJob(event) {
   }
 }
 
-/* ── dlq replay ───────────────────────────────────────────── */
-
 async function retryJob(id) {
   const res = await request(`/jobs/${id}/retry`, { method: "POST" });
   return res.status === 200;
@@ -301,8 +291,6 @@ async function retryAll() {
     refresh();
   }
 }
-
-/* ── wiring ───────────────────────────────────────────────── */
 
 segmented($("#channel"), (value) => {
   state.channel = value;
