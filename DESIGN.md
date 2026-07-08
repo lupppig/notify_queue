@@ -38,7 +38,7 @@ You can run one scheduler and fifty workers. If workers back up, the scheduler i
 
 ## 3. High-Level Architecture
 
-![High-Level Architecture](diagram.png)
+![High-Level Architecture](Job_scheduler_design.png)
 
 Retries and rate-limit deferrals loop back through PostgreSQL (a `send_at` reset) — the scheduler is the only component that ever enqueues to Redis.
 
