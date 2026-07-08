@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -12,13 +13,19 @@ from notify_queue.ratelimit import check_rate_limit
 from notify_queue.webhooks import fire_webhook
 from notify_queue.worker.heartbeat import heartbeat_loop
 
+logger = logging.getLogger(__name__)
+
 FETCH_JOB = """
 SELECT * FROM jobs WHERE id = $1
 """
 
+# Every terminal transition is fenced on ownership (worker_id + claimed): a
+# worker that stalled long enough to be reclaimed by the scheduler must not
+# overwrite state that now belongs to another worker.
 MARK_SENT = """
 UPDATE jobs SET status = 'sent', sent_at = NOW(), updated_at = NOW()
-WHERE id = $1
+WHERE id = $1 AND worker_id = $2 AND status = 'claimed'
+RETURNING id
 """
 
 SCHEDULE_RETRY = """
@@ -26,14 +33,16 @@ UPDATE jobs
 SET status = 'pending', attempt_count = $1, next_retry_at = $2, send_at = $2,
     error_message = $3, worker_id = NULL, claimed_at = NULL, heartbeat_at = NULL,
     updated_at = NOW()
-WHERE id = $4
+WHERE id = $4 AND worker_id = $5 AND status = 'claimed'
+RETURNING id
 """
 
 DEFER_TO_NEXT_WINDOW = """
 UPDATE jobs
 SET status = 'pending', send_at = $1, worker_id = NULL, claimed_at = NULL,
     heartbeat_at = NULL, updated_at = NOW()
-WHERE id = $2
+WHERE id = $2 AND worker_id = $3 AND status = 'claimed'
+RETURNING id
 """
 
 
@@ -79,7 +88,10 @@ async def execute_delivery(
 async def handle_success(
     pool: asyncpg.Pool, redis_client: redis.Redis, job: asyncpg.Record, settings: Settings
 ) -> None:
-    await pool.execute(MARK_SENT, job["id"])
+    updated = await pool.fetchrow(MARK_SENT, job["id"], job["worker_id"])
+    if updated is None:
+        logger.warning("job %s no longer owned; skipping sent transition", job["id"])
+        return
     await redis_client.delete(f"job:lock:{job['id']}")
     await fire_webhook(
         pool,
@@ -100,14 +112,27 @@ async def handle_failure(
 ) -> None:
     attempt = job["attempt_count"] + 1
     if attempt >= job["max_attempts"]:
-        await dead_letter(pool, redis_client, job, error, attempt, settings)
+        await dead_letter(
+            pool,
+            redis_client,
+            job,
+            error,
+            attempt,
+            settings,
+            expected_worker_id=job["worker_id"],
+        )
         return
 
     delay = settings.base_retry_delay_seconds * 2 ** (attempt - 1)
     next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
     # Resetting send_at routes the retry through the scheduler's normal
     # promotion path — no separate retry queue (DESIGN.md §7.6).
-    await pool.execute(SCHEDULE_RETRY, attempt, next_retry_at, error, job["id"])
+    updated = await pool.fetchrow(
+        SCHEDULE_RETRY, attempt, next_retry_at, error, job["id"], job["worker_id"]
+    )
+    if updated is None:
+        logger.warning("job %s no longer owned; skipping retry transition", job["id"])
+        return
     await redis_client.delete(f"job:lock:{job['id']}")
     await fire_webhook(
         pool,
@@ -127,5 +152,8 @@ async def defer_job(
 ) -> None:
     # Deferral is not a failure: attempt_count is untouched and no webhook fires.
     next_window = datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
-    await pool.execute(DEFER_TO_NEXT_WINDOW, next_window, job["id"])
+    updated = await pool.fetchrow(DEFER_TO_NEXT_WINDOW, next_window, job["id"], job["worker_id"])
+    if updated is None:
+        logger.warning("job %s no longer owned; skipping deferral", job["id"])
+        return
     await redis_client.delete(f"job:lock:{job['id']}")

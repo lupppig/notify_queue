@@ -78,7 +78,13 @@ async def recover_stale_claimed_jobs(
         await redis_client.delete(f"job:lock:{job['id']}")
         if job["attempt_count"] >= job["max_attempts"]:
             await dead_letter(
-                pool, redis_client, job, job["error_message"], job["attempt_count"], settings
+                pool,
+                redis_client,
+                job,
+                job["error_message"],
+                job["attempt_count"],
+                settings,
+                expected_worker_id=None,
             )
     return [row["id"] for row in rows]
 

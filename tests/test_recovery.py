@@ -1,4 +1,5 @@
 from notify_queue.scheduler.scheduler import recover_stale_claimed_jobs
+from notify_queue.worker.delivery import handle_failure, handle_success
 
 INSERT_CLAIMED_JOB = """
 INSERT INTO jobs (recipient, channel, payload, send_at, status, attempt_count,
@@ -43,3 +44,47 @@ async def test_reclaim_removes_dead_workers_lock(pool, redis, settings):
     await redis.set(f"job:lock:{job_id}", "dead-worker", ex=60)
     await recover_stale_claimed_jobs(pool, redis, settings)
     assert await redis.exists(f"job:lock:{job_id}") == 0
+
+
+RECLAIM_JOB = """
+UPDATE jobs
+SET status = 'pending', worker_id = NULL, attempt_count = attempt_count + 1,
+    heartbeat_at = NULL, updated_at = NOW()
+WHERE id = $1
+"""
+
+
+async def stale_claim(pool, attempt_count=0, max_attempts=3):
+    # A worker's view of the job before the scheduler reclaims it out from
+    # under it — the zombie-worker race (DESIGN.md §10.3).
+    job_id = await pool.fetchval(
+        INSERT_CLAIMED_JOB, "user@example.com", attempt_count, max_attempts, 10
+    )
+    stale_view = await pool.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
+    await pool.execute(RECLAIM_JOB, job_id)
+    return job_id, stale_view
+
+
+async def test_zombie_worker_cannot_mark_a_reclaimed_job_sent(pool, redis, settings):
+    job_id, stale_view = await stale_claim(pool)
+    await handle_success(pool, redis, stale_view, settings)
+    row = await pool.fetchrow("SELECT status, sent_at FROM jobs WHERE id = $1", job_id)
+    assert row["status"] == "pending"
+    assert row["sent_at"] is None
+
+
+async def test_zombie_worker_cannot_reschedule_a_reclaimed_job(pool, redis, settings):
+    job_id, stale_view = await stale_claim(pool)
+    await handle_failure(pool, redis, stale_view, "late failure", settings)
+    row = await pool.fetchrow("SELECT status, attempt_count FROM jobs WHERE id = $1", job_id)
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 1
+
+
+async def test_zombie_worker_cannot_dead_letter_a_reclaimed_job(pool, redis, settings):
+    job_id, stale_view = await stale_claim(pool, attempt_count=2, max_attempts=3)
+    await handle_failure(pool, redis, stale_view, "late failure at cap", settings)
+    assert await pool.fetchval("SELECT status FROM jobs WHERE id = $1", job_id) == "pending"
+    assert (
+        await pool.fetchval("SELECT COUNT(*) FROM dead_letter_queue WHERE job_id = $1", job_id) == 0
+    )
