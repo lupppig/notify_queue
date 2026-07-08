@@ -12,40 +12,100 @@
   <span id="conn" class="conn ok">connected</span>
 </header>
 
-<section id="metrics" class="metrics"></section>
+<section id="metrics" class="metrics" aria-label="job counts by status"></section>
+<div id="metrics-bar" class="metrics-bar" aria-hidden="true"></div>
+
+<div class="columns">
+  <section class="panel">
+    <h2>schedule a job</h2>
+    <form id="job-form" novalidate>
+      <div class="field">
+        <label for="recipient">recipient</label>
+        <input id="recipient" placeholder="user@example.com" autocomplete="off">
+      </div>
+
+      <div class="field">
+        <label>channel</label>
+        <div class="segmented" id="channel">
+          <button type="button" data-value="email" class="on">email</button>
+          <button type="button" data-value="sms">sms</button>
+          <button type="button" data-value="push">push</button>
+        </div>
+      </div>
+
+      <div id="payload-fields"></div>
+
+      <div class="field">
+        <label>priority</label>
+        <div class="segmented" id="priority">
+          <button type="button" data-value="high">high</button>
+          <button type="button" data-value="medium" class="on">medium</button>
+          <button type="button" data-value="low">low</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>deliver</label>
+        <div class="segmented" id="schedule-mode">
+          <button type="button" data-value="now" class="on">now</button>
+          <button type="button" data-value="delay">after a delay</button>
+          <button type="button" data-value="at">at a time</button>
+        </div>
+        <div class="schedule-inputs">
+          <span id="delay-inputs" hidden>
+            <input id="delay-amount" type="number" min="1" value="30">
+            <select id="delay-unit">
+              <option value="1">seconds</option>
+              <option value="60">minutes</option>
+              <option value="3600">hours</option>
+            </select>
+          </span>
+          <input id="send-at" type="datetime-local" hidden>
+        </div>
+      </div>
+
+      <details>
+        <summary>options</summary>
+        <div class="field">
+          <label for="callback-url">webhook callback url</label>
+          <div class="inline">
+            <input id="callback-url" placeholder="https://example.com/webhook">
+            <button type="button" id="use-mock" title="use this API's stub receiver">use mock</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="idempotency-key">idempotency key</label>
+          <input id="idempotency-key" placeholder="order-123-confirmation" autocomplete="off">
+        </div>
+      </details>
+
+      <div class="form-footer">
+        <button type="submit" id="submit-btn" class="primary">schedule job</button>
+        <span id="form-error" class="error" role="alert"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>jobs</h2>
+      <button id="clear-filter" hidden></button>
+    </div>
+    <table id="jobs">
+      <thead><tr>
+        <th>id</th><th>recipient</th><th>channel</th><th>priority</th>
+        <th>status</th><th>attempts</th><th>send at</th><th>updated</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</div>
 
 <section class="panel">
-  <h2>schedule job</h2>
-  <form id="job-form">
-    <input name="recipient" placeholder="recipient" required>
-    <select name="channel">
-      <option>email</option><option>sms</option><option>push</option>
-    </select>
-    <select name="priority">
-      <option>high</option><option selected>medium</option><option>low</option>
-    </select>
-    <input name="delay_seconds" type="number" min="0" value="0" title="delay in seconds">
-    <input name="payload" class="wide" value='{"subject":"hello","body":"world"}' title="JSON payload">
-    <input name="callback_url" class="wide" placeholder="callback url (optional)">
-    <input name="idempotency_key" placeholder="idempotency key (optional)">
-    <button type="submit">submit</button>
-    <span id="form-msg"></span>
-  </form>
-</section>
-
-<section class="panel">
-  <h2>jobs</h2>
-  <table id="jobs">
-    <thead><tr>
-      <th>id</th><th>recipient</th><th>channel</th><th>priority</th>
-      <th>status</th><th>attempts</th><th>send at</th><th>updated</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
-</section>
-
-<section class="panel">
-  <h2>dead letters</h2>
+  <div class="panel-head">
+    <h2>dead letters</h2>
+    <button id="retry-all" hidden>retry all</button>
+  </div>
   <table id="dlq">
     <thead><tr>
       <th>id</th><th>recipient</th><th>channel</th><th>attempts</th><th>last error</th><th></th>
@@ -54,6 +114,7 @@
   </table>
 </section>
 
+<div id="toast" class="toast" hidden></div>
 <script src="/app.js"></script>
 </body>
 </html>
