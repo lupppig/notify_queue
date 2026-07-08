@@ -11,7 +11,10 @@ from httpx import ASGITransport, AsyncClient
 from notify_queue.api.app import create_app
 from notify_queue.config import Settings
 from notify_queue.db import create_pool
+from notify_queue.log import setup_logging
 from notify_queue.redis_client import create_redis
+
+setup_logging("test", log_file="test.log")
 
 ADMIN_DATABASE_URL = "postgresql://notify:notify@localhost:5433/notifications"
 TEST_DATABASE_URL = "postgresql://notify:notify@localhost:5433/notifications_test"
