@@ -31,22 +31,45 @@ class Simulation:
         burst_recipient: str,
         poll_seconds: float,
         timeout_seconds: float,
+        run_delivery: bool = True,
+        run_idempotency: bool = True,
+        run_rate_limit: bool = True,
     ) -> None:
         self.client = client
         self.api = api
-        self.jobs = jobs
-        self.burst = burst
+        self.jobs = jobs if run_delivery else 0
+        self.burst = burst if run_rate_limit else 0
         self.burst_recipient = burst_recipient
         self.poll_seconds = poll_seconds
         self.timeout_seconds = timeout_seconds
-        self.total = jobs + 1 + burst
+        self.run_delivery = run_delivery
+        self.run_idempotency = run_idempotency
+        self.run_rate_limit = run_rate_limit
+        self.total = self.jobs + (1 if self.run_idempotency else 0) + self.burst
 
     def run(self) -> None:
         """Execute the full simulation: submit, watch, verify."""
+        tests_running = []
+        if self.run_delivery: tests_running.append("Standard Delivery (success/retry/fail)")
+        if self.run_idempotency: tests_running.append("Idempotency")
+        if self.run_rate_limit: tests_running.append("Rate Limits")
+        
+        logger.info("=== Starting Simulation ===")
+        logger.info("Active Tests: %s", ", ".join(tests_running))
+        logger.info("===========================")
+
         baseline = self.metrics()
-        self.submit_mixed_jobs()
-        self.submit_duplicate_pair()
-        self.submit_rate_limit_burst()
+        
+        if self.run_delivery:
+            self.submit_delivery_jobs()
+        if self.run_idempotency:
+            self.submit_duplicate_pair()
+        if self.run_rate_limit:
+            self.submit_rate_limit_burst()
+
+        if self.total == 0:
+            logger.info("no jobs submitted, nothing to watch.")
+            return
 
         logger.info("watching metrics until the queue drains (submitted=%d)...", self.total)
         final, deferred = self.watch_until_drained()
@@ -67,9 +90,9 @@ class Simulation:
         """Submit a single job to the API."""
         return self.client.post("/jobs", json=body)
 
-    def submit_mixed_jobs(self) -> None:
+    def submit_delivery_jobs(self) -> None:
         """Submit a spread of jobs across priorities, channels, and short delays."""
-        logger.info("submitting %d mixed-priority jobs with 0-14s delays...", self.jobs)
+        logger.info("[Delivery Test] submitting %d jobs with 0-14s delays...", self.jobs)
         for i in range(self.jobs):
             response = self.submit(
                 {
@@ -87,7 +110,7 @@ class Simulation:
 
     def submit_duplicate_pair(self) -> None:
         """Submit the same idempotency key twice; expect 201 then 409."""
-        logger.info("submitting a duplicate idempotency pair (expecting 201 then 409)...")
+        logger.info("[Idempotency Test] submitting a duplicate idempotency pair (expecting 201 then 409)...")
         body = {
             "recipient": "dup@example.com",
             "channel": "email",
@@ -105,7 +128,7 @@ class Simulation:
 
     def submit_rate_limit_burst(self) -> None:
         """Flood one recipient to trigger the per-hour rate limit."""
-        logger.info("submitting %d jobs to %s to trip the rate limit...", self.burst, self.burst_recipient)
+        logger.info("[Rate Limit Test] submitting %d jobs to %s to trip the rate limit...", self.burst, self.burst_recipient)
         for _ in range(self.burst):
             response = self.submit(
                 {
@@ -157,6 +180,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--burst-recipient", default="hot@example.com")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--only-delivery", action="store_true", help="Run only the standard delivery test")
+    parser.add_argument("--only-idempotency", action="store_true", help="Run only the idempotency test")
+    parser.add_argument("--only-rate-limit", action="store_true", help="Run only the rate limit burst test")
     return parser.parse_args()
 
 
@@ -170,6 +196,15 @@ def main() -> None:
         except httpx.HTTPError:
             logger.error("api unreachable at %s", args.api)
             sys.exit(1)
+        run_delivery = True
+        run_idempotency = True
+        run_rate_limit = True
+
+        if args.only_delivery or args.only_idempotency or args.only_rate_limit:
+            run_delivery = args.only_delivery
+            run_idempotency = args.only_idempotency
+            run_rate_limit = args.only_rate_limit
+
         Simulation(
             client=client,
             api=args.api,
@@ -178,6 +213,9 @@ def main() -> None:
             burst_recipient=args.burst_recipient,
             poll_seconds=args.poll_seconds,
             timeout_seconds=args.timeout_seconds,
+            run_delivery=run_delivery,
+            run_idempotency=run_idempotency,
+            run_rate_limit=run_rate_limit,
         ).run()
 
 

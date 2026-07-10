@@ -7,7 +7,7 @@ API_PORT ?= 8080
 .DEFAULT_GOAL := help
 
 .PHONY: help setup up down nuke install migrate api scheduler worker dev \
-        test lint fmt seed simulate reset psql redis
+        test lint fmt seed simulate simulate-delivery simulate-idempotency simulate-ratelimit reset psql redis
 
 help: ## list available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -61,6 +61,15 @@ seed: ## wipe and seed the database with realistic data
 
 simulate: ## drive the running system end to end
 	uv run python scripts/simulate.py --api http://$(API_HOST):$(API_PORT)
+
+simulate-delivery: ## run only the standard delivery test (successes/failures/retries)
+	uv run python scripts/simulate.py --api http://$(API_HOST):$(API_PORT) --only-delivery
+
+simulate-idempotency: ## run only the idempotency test
+	uv run python scripts/simulate.py --api http://$(API_HOST):$(API_PORT) --only-idempotency
+
+simulate-ratelimit: ## run only the rate limit test
+	uv run python scripts/simulate.py --api http://$(API_HOST):$(API_PORT) --only-rate-limit
 
 reset: ## empty all tables and redis queues
 	$(PSQL) -c "TRUNCATE webhook_log, dead_letter_queue, job_idempotency, jobs"
